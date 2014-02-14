@@ -2,8 +2,9 @@ package zuluaga.cluster
  
 import akka.actor._
 import com.typesafe.config.ConfigFactory
-import akka.contrib.pattern.{ClusterClient, ClusterReceptionistExtension}
- 
+import akka.contrib.pattern.{ShardRegion, ClusterSharding, ClusterClient, ClusterReceptionistExtension}
+import akka.persistence.{SnapshotOffer, EventsourcedProcessor}
+
 object DemoMaster {
  
   def main(args: Array[String]): Unit = {
@@ -20,28 +21,81 @@ object DemoMaster {
            port = 2551
          }
        }
- 
+
        cluster {
          seed-nodes = [
            "akka.tcp://ClusterSystem@127.0.0.1:2551"
            ]
- 
+
          roles = [master]
- 
+
          auto-down = on
        }
+       persistence.journal.leveldb.native = off
      }""")
  
     val system = ActorSystem("ClusterSystem", ConfigFactory.load(config))
-    val master = system.actorOf(Props[ClusterMaster], "master")
+
+    ClusterSharding(system).start(
+      typeName = "ClusterMaster",
+      entryProps = Some(Props[ ClusterMaster ]),
+      idExtractor = ClusterMaster.idExtractor,
+      shardResolver = ClusterMaster.shardResolver)
+
+    ClusterSharding(system).start(
+      typeName = "AnotherClusterMaster",
+      entryProps = Some(Props[ ClusterMaster ]),
+      idExtractor = ClusterMaster.idExtractor,
+      shardResolver = ClusterMaster.shardResolver)
+
+    val master = system.actorOf(Props[ClusterMasterProxy], "master")
     ClusterReceptionistExtension(system).registerService(master)
   }
- 
-  class ClusterMaster extends Actor with ActorLogging {
+  class ClusterMasterProxy extends Actor with ActorLogging {
     def receive = {
-      case e =>
-        log.info(s"from master : $e : $sender")
-        sender ! "master : how are you?"
+
+      case e: Int =>
+        //extra pattern
+        val originalSender = sender
+        context.actorOf(Props(new Actor() {
+          val region: ActorRef = ClusterSharding(context.system).shardRegion("ClusterMaster")
+
+          override def receive = {
+            case x => originalSender ! x
+          }
+
+          region ! e
+        }))
+    }
+  }
+  object ClusterMaster {
+    val idExtractor: ShardRegion.IdExtractor = {
+      case c: Int => (c.toString, c)
+    }
+
+    val shardResolver: ShardRegion.ShardResolver = msg => msg match {
+      case c: Int => c.toString
+    }
+  }
+  class ClusterMaster extends EventsourcedProcessor with ActorLogging {
+    var count: Int = 0
+
+    def update(e: Int) =
+      count = count + 1
+
+
+    override def receiveCommand = {
+      case e :Int =>
+        persist(e)(update)
+        log.info(s"from master : $e : $count : $sender")
+        sender ! s"master : how are you? + $count"
+    }
+
+    override def receiveRecover = {
+      case e: Int =>
+        update(e)
+      case SnapshotOffer(_, snapshot: Int) =>
+        count = snapshot
     }
   }
 }
@@ -121,7 +175,7 @@ object DemoClient {
 	
 		def receive = {
 		  case i : Int =>
-			c ! ClusterClient.Send("/user/master", s"hello - $i", localAffinity = true)
+			c ! ClusterClient.Send("/user/master", i, localAffinity = true)
 			c ! ClusterClient.Send("/user/member", s"hello - $i", localAffinity = true)
 		  case e =>
 			log.info(s"$e")
